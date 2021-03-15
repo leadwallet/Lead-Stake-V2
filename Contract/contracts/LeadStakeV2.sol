@@ -528,14 +528,16 @@ contract LeadStakeV2 is Owned {
     IERC20 private LEAD;
     IERC20 private USDT;
     IERC20 private lpToken;
+    IERC20 private bonusToken;
     
     LeadStakeV1 private _leadStakeV1;
     UniswapV2Router private _uniswapRouter;
     IUniswapV2Factory private _iUniswapV2Factory;
     
     uint private constant SCALAR = 10**36;
-    uint private _pendingBonuses;
+    uint public pendingBonuses;
     
+    //  1000 = 1%
     uint public basicROI;
     uint public secondaryROI;
     uint public tertiaryROI;
@@ -545,48 +547,59 @@ contract LeadStakeV2 is Owned {
     uint public secondaryPeriod;
     uint public tertiaryPeriod;
     
+    uint public totalProviders;
+    
+    address public migrationContract;
+    
     struct User {
         uint start;
         uint release;
         uint bonus;
         uint withdrawn;
         uint liquidity;
-    }
+        bool migrated;
+    } 
     
-    struct Asset {
-        uint id;
-        address addr;
-    }
+    //mapping user address to struct
+    mapping(address => User) private _users; 
     
-    mapping(address => User) private _users;
-    Asset[] private assets;
-    
+    //events
     event BonusAdded(address indexed user, uint amount);
     event Filtered(address indexed owner, uint amount);
+    event VersionMigrated(address indexed owner, uint timeStamp, address migrationContract);
+    event LiquidityMigrated(address indexed user, uint liquidity, address migrationContract);
+    event BonusTokenChanged(address indexed owner, address newBonusToken);
     event BonusWithdrawn(address indexed user, uint amount);
+    event LiquidityRelocked(address indexed user, uint LEADAmount, uint USDTAmount, uint term);
     event LiquidityAdded(address indexed user, uint liquidity, uint amountUSDT, uint amountLEAD);
     event LiquidityWithdrawn(address indexed user, uint liquidity, uint amountUSDT, uint amountLEAD);
 
-    //"0xef6Ce67d826Ed929783e81C31bFC6d42311Fd2db", "0xFDa30F224ED770F91821751b67ee0cAaf84F6F82"
-    constructor(address _lead, address _usdt) public {
+    constructor(address _lead, address _usdt, address _bonusToken) public {
         
         LEAD = IERC20(_lead);              
         USDT = IERC20(_usdt);
+        bonusToken = IERC20(_bonusToken);
         
         _iUniswapV2Factory = IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
         address _lpToken = _iUniswapV2Factory.getPair(address(LEAD), address(USDT));
-        require(_lpToken != address(0), "Pair must be created on uniswap first");
+        require(_lpToken != address(0), "Pair must be created on uniswap already");
         lpToken = IERC20(_lpToken);
         
         _uniswapRouter = UniswapV2Router(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D); 
         _leadStakeV1 = LeadStakeV1(0xCF24776C3c16E8F16C870935cD18Cfa5F80687C6);             //ropsten
     }
     
+    modifier nonMigrant() {
+        
+        require(!getUserMigration(msg.sender), "must not be migrated already");
+        _;
+    }    
+    
     
     // ---------------- WRITE FUNCTIONS---------------------------------------------
     
     
-    function changeROIs(
+    function changeROI(
         uint _basicROI, uint _secondaryROI, uint _tertiaryROI, uint _masterROI
     ) external onlyOwner returns(bool) {
         
@@ -598,7 +611,7 @@ contract LeadStakeV2 is Owned {
         return true;
     }
     
-    function changePeriods(uint _basic, uint _secondary, uint _tertiary) external onlyOwner returns(bool) {
+    function changePeriods(uint _basic, uint _secondary, uint _tertiary) external onlyOwner returns(bool changed) {
         
         basicPeriod = _basic;
         secondaryPeriod = _secondary;
@@ -606,46 +619,77 @@ contract LeadStakeV2 is Owned {
         
         return true;
     }
+    
+    function changeBonusToken(address _newBonusToken) external onlyOwner returns(bool changed) {
+        
+        require(address(bonusToken) != _newBonusToken, "token is already set");
+        require(availableBonus() == 0, "need to filter available bonuses first");
+        
+        bonusToken = IERC20(_newBonusToken);
+        emit BonusTokenChanged(msg.sender, _newBonusToken);
+        return true;
+    }
 
-    function addBonus(uint _amount) external returns(bool) {
+    function addBonus(uint _amount) external returns(bool added) {
         
         require(_amount > 0, "invalid amount selected");
-        require(LEAD.transferFrom(msg.sender, address(this), _amount), "must approve smart contract");
+        require(bonusToken.transferFrom(msg.sender, address(this), _amount), "must approve smart contract");
         
         emit BonusAdded(msg.sender, _amount);
         return true;
     }
     
-    function filter(uint256 _amount) external onlyOwner returns (bool) {
+    function filter(uint256 _amount) external onlyOwner returns (bool filtered) {
        
         require(_amount > 0, "amount must be larger than zero");
         require(_checkForSufficientBonus(_amount), 'cannot withdraw above current bonus balance');
-        require(LEAD.transfer(msg.sender, _amount), "error: token transfer failed");
+        
+        require(bonusToken.transfer(msg.sender, _amount), "error: token transfer failed");
 
         emit Filtered(msg.sender, _amount);
         return true;
     }
     
-    function addLiquidity(uint _leadAmount, uint _term, address _asset) external returns(bool) {
+    function activateMigration(address _unistakeMigrationContract) external onlyOwner returns(bool activated) {
+        
+        require(_unistakeMigrationContract != address(0x0), "cannot migrate to a null address");
+        migrationContract = _unistakeMigrationContract;
+        
+        emit VersionMigrated(msg.sender, now, migrationContract);
+        return true;
+    }
+    
+    function migrate(address _unistakeMigrationContract) external nonMigrant returns(bool migrated) {
+        
+        require(_unistakeMigrationContract != address(0x0), "cannot migrate to a null address");
+        require(migrationContract == _unistakeMigrationContract, "must confirm endpoint");
+        
+        _users[msg.sender].migrated = true;
+        
+        uint256 liquidity = _users[msg.sender].liquidity;
+        lpToken.transfer(migrationContract, liquidity);
+        
+        emit LiquidityMigrated(msg.sender, liquidity, migrationContract);
+        return true;
+    }
+    
+    function addLiquidity(uint _leadAmount, uint _term) external nonMigrant returns(bool success) {
         
         require(now >= _users[msg.sender].release, "cannot override current term");
-        for (uint i = 0; assets.length < i; i++) require(assets[i].addr == _asset, "wrong asset inputted");
         
-        IERC20 ASSET = IERC20(_asset);
-        uint assetValue = rate(_leadAmount, address(LEAD), address(ASSET));
-        
+        uint assetValue = rate(_leadAmount, address(LEAD), address(USDT));
         require(LEAD.transferFrom(msg.sender, address(this), _leadAmount), "must approve smart contract");
-        require(ASSET.transferFrom(msg.sender, address(this), assetValue), "must approve smart contract");
+        require(USDT.transferFrom(msg.sender, address(this), assetValue), "must approve smart contract");
         
         if (getUserPendingBonus(msg.sender) > 0) withdrawUserBonus();
         
         LEAD.approve(address(_uniswapRouter), _leadAmount);
-        ASSET.approve(address(_uniswapRouter), assetValue);
+        USDT.approve(address(_uniswapRouter), assetValue);
             
         (uint amountLEAD, uint amountUSDT, uint liquidity) = 
             _uniswapRouter.addLiquidity(
                 address(LEAD), 
-                address(ASSET), 
+                address(USDT), 
                 _leadAmount,
                 assetValue, 
                 0, 
@@ -655,6 +699,9 @@ contract LeadStakeV2 is Owned {
         
         _users[msg.sender].start = now;
         _users[msg.sender].release = now.add(_term);
+        
+        totalProviders++;
+        
         _users[msg.sender].liquidity = _users[msg.sender].liquidity.add(liquidity);  
         
         uint leadRP = _calculateReturnPercentage(_term);
@@ -667,25 +714,24 @@ contract LeadStakeV2 is Owned {
         return true;
     }
     
-    function relockLiquidity(uint _term) external returns(bool) {
+    function relockLiquidity(uint _term) external nonMigrant returns(bool success) {
         
         require(now >= _users[msg.sender].release, "cannot override current term");
         require(_users[msg.sender].liquidity > 0, "do not have any liquidity to lock");
         
-        uint leadRP = _calculateReturnPercentage(_term);
+        if (getUserPendingBonus(msg.sender) > 0) withdrawUserBonus();
         
         _users[msg.sender].start = now;
         _users[msg.sender].release = now.add(_term);
         
-        if (getUserPendingBonus(msg.sender) > 0) withdrawUserBonus();
-        
-        if (_leadStakeV1.stakes(msg.sender) > 0) _relock(1, leadRP);
-        else _relock(0, leadRP);
+        uint leadRP = _calculateReturnPercentage(_term);
+        if (_leadStakeV1.stakes(msg.sender) > 0) _relock(1, leadRP, _term);
+        else _relock(0, leadRP, _term);
         
         return true;
     }
     
-    function withdrawLiquidity(uint _amount) external returns(bool) {
+    function withdrawLiquidity(uint _amount) external nonMigrant returns(bool success) {
         
         require(now >= _users[msg.sender].release, "cannot override current term");
         
@@ -706,11 +752,13 @@ contract LeadStakeV2 is Owned {
                 msg.sender,
                 now);
         
+        if (_users[msg.sender].liquidity == 0) totalProviders--;
+        
         emit LiquidityWithdrawn(msg.sender, _amount, amountUSDT, amountLEAD);
         return true;
     }
     
-    function withdrawUserBonus() public returns(bool) {
+    function withdrawUserBonus() public returns(bool success) {
         
         uint released = _calculateReleasedAmount(msg.sender);
         require(released > 0, "must wait for bonus to be released");
@@ -730,9 +778,9 @@ contract LeadStakeV2 is Owned {
     // ---------------- READ FUNCTIONS---------------------------------------------
     
     
-    function availableBonus() external view returns(uint available_LEAD) {
+    function availableBonus() public view returns(uint available_LEAD) {
         
-        return (LEAD.balanceOf(address(this))).sub(_pendingBonuses);
+        return (bonusToken.balanceOf(address(this))).sub(pendingBonuses);
     }
     
     function rate(uint _amount, address _tokenA, address _tokenB) public view returns(uint equivalent) {
@@ -742,9 +790,19 @@ contract LeadStakeV2 is Owned {
         return UniswapV2Library.quote(_amount, reserveA, reserveB);
     }
     
-    function getLPTokenAddress() external view returns(address) {
+    function getLPTokenAddress() external view returns(address LP_address) {
         
         return address(lpToken);
+    }
+    
+    function getTotalLP() external view returns(uint total_LP) {
+        
+        return lpToken.balanceOf(address(this));
+    }
+    
+    function getUserMigration(address _user) public view returns(bool has_migrated) {
+        
+        return _users[_user].migrated;
     }
     
     function getUserLiquidity(address _user) public view returns(uint LEAD_amount, uint USDT_amount) {
@@ -769,17 +827,17 @@ contract LeadStakeV2 is Owned {
         else return 0;
     }
     
-    function getUserPendingBonus(address _user) public view returns(uint LEAD_bonus) {
+    function getUserPendingBonus(address _user) public view returns(uint bonus_pending) {
         
         uint taken = _users[_user].withdrawn;
         uint bonus = _users[_user].bonus;
         return (bonus.sub(taken));
     }
     
-    function getUserAvailableBonus(address _user) external view returns(uint LEAD_Released) {
+    function getUserAvailableBonus(address _user) external view returns(uint bonus_Released) {
         
         return _calculateReleasedAmount(_user);
-    } 
+    }
     
     
     // ---------------- PRIVATE FUNCTIONS ---------------------------------------------
@@ -788,8 +846,6 @@ contract LeadStakeV2 is Owned {
     function _withV1(uint amountLEAD, uint leadRP) private {
             
         uint v1Stakes = _leadStakeV1.stakes(msg.sender);
-        require(v1Stakes > 0, "must stake in V1");
-       
         uint addedBonus;
      
         if (v1Stakes > amountLEAD) addedBonus = (_calculateBonus((amountLEAD.add(amountLEAD)), leadRP));
@@ -799,7 +855,7 @@ contract LeadStakeV2 is Owned {
         "must be sufficient staking bonuses available in pool");
                     
         _users[msg.sender].bonus = _users[msg.sender].bonus.add(addedBonus);
-        _pendingBonuses = _pendingBonuses.add(addedBonus);
+        pendingBonuses = pendingBonuses.add(addedBonus);
     }
     
     function _withoutV1(uint amountLEAD, uint leadRP) private {
@@ -809,15 +865,17 @@ contract LeadStakeV2 is Owned {
         "must be sufficient staking bonuses available in pool");
                 
         _users[msg.sender].bonus = _users[msg.sender].bonus.add(addedBonus);
-        _pendingBonuses = _pendingBonuses.add(addedBonus);
+        pendingBonuses = pendingBonuses.add(addedBonus);
     }
     
-    function _relock(uint _useV1, uint leadRP) private {
+    function _relock(uint _useV1, uint leadRP, uint _term) private {
         
-        (uint leadAmount,) = getUserLiquidity(msg.sender);
+        (uint leadAmount, uint usdtAmount) = getUserLiquidity(msg.sender);
         
         if (_useV1 == 1) _withV1(leadAmount, leadRP);
         else _withoutV1(leadAmount, leadRP);
+        
+        emit LiquidityRelocked(msg.sender, leadAmount, usdtAmount, _term);
     }
 
     function _calculateBonus(uint _amount, uint _returnPercentage) internal pure returns(uint) {
@@ -827,7 +885,7 @@ contract LeadStakeV2 is Owned {
 
     function _checkForSufficientBonus(uint _amount) private view returns(bool) {
        
-        if ((LEAD.balanceOf(address(this)).sub(_pendingBonuses)) >= _amount) return true;
+        if ((bonusToken.balanceOf(address(this)).sub(pendingBonuses)) >= _amount) return true;
         else return false;
     }
     
@@ -857,9 +915,9 @@ contract LeadStakeV2 is Owned {
     function _withdrawUserBonus(address _user, uint released) private returns(bool) {
         
         _users[_user].withdrawn = _users[_user].withdrawn.add(released);
-        _pendingBonuses = _pendingBonuses.sub(released);
+        pendingBonuses = pendingBonuses.sub(released);
         
-        LEAD.transfer(_user, released);
+        bonusToken.transfer(_user, released);
     
         emit BonusWithdrawn(_user, released);
         return true;
