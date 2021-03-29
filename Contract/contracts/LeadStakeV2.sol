@@ -542,6 +542,7 @@ contract LeadStakeV2 is Owned {
     uint public secondaryROI;
     uint public tertiaryROI;
     uint public masterROI;
+    uint public taxRate;
     
     uint public basicPeriod;
     uint public secondaryPeriod;
@@ -550,6 +551,7 @@ contract LeadStakeV2 is Owned {
     uint public totalProviders;
     
     address public migrationContract;
+    address private feeTaker;
     
     struct User {
         uint start;
@@ -598,6 +600,18 @@ contract LeadStakeV2 is Owned {
     
     // ---------------- WRITE FUNCTIONS---------------------------------------------
     
+    
+    function setTaxRate(uint _tax) external onlyOwner returns(bool) {
+        
+        taxRate = _tax;
+        return true;
+    }
+    
+    function setFeeTaker(address _feeTaker) external onlyOwner returns(bool) {
+        
+        feeTaker = _feeTaker;
+        return true;
+    }
     
     function changeROI(
         uint _basicROI, uint _secondaryROI, uint _tertiaryROI, uint _masterROI
@@ -685,13 +699,16 @@ contract LeadStakeV2 is Owned {
         
         LEAD.approve(address(_uniswapRouter), _leadAmount);
         USDT.approve(address(_uniswapRouter), assetValue);
-            
+        
+        uint platformShare = (_leadAmount.mul(taxRate)).div(100000);
+        uint platformShareUSDT = rate(platformShare, address(LEAD), address(USDT));
+        
         (uint amountLEAD, uint amountUSDT, uint liquidity) = 
             _uniswapRouter.addLiquidity(
                 address(LEAD), 
                 address(USDT), 
-                _leadAmount,
-                assetValue, 
+                _leadAmount.sub(platformShare),
+                assetValue.sub(platformShareUSDT), 
                 0, 
                 0, 
                 address(this), 
@@ -709,6 +726,9 @@ contract LeadStakeV2 is Owned {
         
         if (_leadStakeV1.stakes(msg.sender) > 0) _withV1(leadAmount, leadRP);
         else _withoutV1(leadAmount, leadRP);
+        
+        require(LEAD.transfer(feeTaker, platformShare));
+        require(USDT.transfer(feeTaker, platformShareUSDT));
         
         emit LiquidityAdded(msg.sender, liquidity, amountUSDT, amountLEAD);
         return true;
