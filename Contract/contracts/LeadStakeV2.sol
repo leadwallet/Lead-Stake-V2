@@ -2,48 +2,7 @@
 
 pragma solidity 0.6.12;
 
-library SafeMath {
-    function add(uint a, uint b) internal pure returns (uint c) {
-        c = a + b;
-        require(c >= a);
-    }
-
-    function sub(uint a, uint b) internal pure returns (uint c) {
-        require(b <= a);
-        c = a - b;
-    }
-
-    function mul(uint a, uint b) internal pure returns (uint c) {
-        c = a * b;
-        require(a == 0 || c / a == b);
-    }
-
-    function div(uint a, uint b) internal pure returns (uint c) {
-        require(b > 0);
-        c = a / b;
-    }
-    
-    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
-        return mod(a, b, "SafeMath: modulo by zero");
-    }
-    
-    function mod(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
-        require(b != 0, errorMessage);
-        return a % b;
-    }
-}
-
-interface IERC20 {
-    function transfer(address to, uint tokens) external returns (bool success);
-    function transferFrom(address from, address to, uint tokens) external returns (bool success);
-    function balanceOf(address tokenOwner) external view returns (uint balance);
-    function approve(address spender, uint tokens) external returns (bool success);
-    function allowance(address tokenOwner, address spender) external view returns (uint remaining);
-    function totalSupply() external view returns (uint);
-
-    event Transfer(address indexed from, address indexed to, uint tokens);
-    event Approval(address indexed tokenOwner, address indexed spender, uint tokens);
-}
+import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 
 interface UniswapV2Router{
     
@@ -524,6 +483,7 @@ contract LeadStakeV1 is Owned {
 
 contract LeadStakeV2 is Owned {
     using SafeMath for uint;
+    using SafeERC20 for IERC20;
     
     IERC20 private LEAD;
     IERC20 private USDT;
@@ -551,7 +511,7 @@ contract LeadStakeV2 is Owned {
     uint public totalProviders;
     
     address public migrationContract;
-    address private feeTaker;
+    address public feeTaker;
     
     struct User {
         uint start;
@@ -568,6 +528,9 @@ contract LeadStakeV2 is Owned {
     //events
     event BonusAdded(address indexed user, uint amount);
     event Filtered(address indexed owner, uint amount);
+    event NewTaxRate(address indexed owner, uint rate);
+    event NewFeeTaker(address indexed owner, address feeTaker);
+    event NewROI(uint basicROI, uint secondaryROI, uint tertiaryROI, uint masterROI);
     event VersionMigrated(address indexed owner, uint timeStamp, address migrationContract);
     event LiquidityMigrated(address indexed user, uint liquidity, address migrationContract);
     event BonusTokenChanged(address indexed owner, address newBonusToken);
@@ -576,19 +539,19 @@ contract LeadStakeV2 is Owned {
     event LiquidityAdded(address indexed user, uint liquidity, uint amountUSDT, uint amountLEAD);
     event LiquidityWithdrawn(address indexed user, uint liquidity, uint amountUSDT, uint amountLEAD);
 
-    constructor(address _lead, address _usdt, address _bonusToken) public {
+    constructor(address _lead, address _usdt, address _bonusToken, address _V1) public {
         
         LEAD = IERC20(_lead);              
         USDT = IERC20(_usdt);
         bonusToken = IERC20(_bonusToken);
+        _leadStakeV1 = LeadStakeV1(_V1);
         
         _iUniswapV2Factory = IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
         address _lpToken = _iUniswapV2Factory.getPair(address(LEAD), address(USDT));
         require(_lpToken != address(0), "Pair must be created on uniswap already");
         lpToken = IERC20(_lpToken);
         
-        _uniswapRouter = UniswapV2Router(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D); 
-        _leadStakeV1 = LeadStakeV1(0xCF24776C3c16E8F16C870935cD18Cfa5F80687C6);             //ropsten
+        _uniswapRouter = UniswapV2Router(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
     }
     
     modifier nonMigrant() {
@@ -604,12 +567,17 @@ contract LeadStakeV2 is Owned {
     function setTaxRate(uint _tax) external onlyOwner returns(bool) {
         
         taxRate = _tax;
+
+        emit NewTaxRate(msg.sender, _tax);
         return true;
     }
     
     function setFeeTaker(address _feeTaker) external onlyOwner returns(bool) {
         
+        require(_feeTaker != address(0x0), "cannot set a null address");
         feeTaker = _feeTaker;
+
+        emit NewFeeTaker(msg.sender, _feeTaker);
         return true;
     }
     
@@ -622,6 +590,7 @@ contract LeadStakeV2 is Owned {
         tertiaryROI = _tertiaryROI;
         masterROI = _masterROI;
         
+        emit NewROI(_basicROI, _secondaryROI, _tertiaryROI, _masterROI);
         return true;
     }
     
@@ -667,23 +636,24 @@ contract LeadStakeV2 is Owned {
     function activateMigration(address _unistakeMigrationContract) external onlyOwner returns(bool activated) {
         
         require(_unistakeMigrationContract != address(0x0), "cannot migrate to a null address");
+        require(migrationContract == address(0x0), "already migrated contract");
         migrationContract = _unistakeMigrationContract;
         
         emit VersionMigrated(msg.sender, now, migrationContract);
         return true;
     }
     
-    function migrate(address _unistakeMigrationContract) external nonMigrant returns(bool migrated) {
+    function migrate() external nonMigrant returns(bool migrated) {
         
-        require(_unistakeMigrationContract != address(0x0), "cannot migrate to a null address");
-        require(migrationContract == _unistakeMigrationContract, "must confirm endpoint");
+        address addr = migrationContract;
+        require(addr != address(0x0), "migration is not active yet");
         
         _users[msg.sender].migrated = true;
         
         uint256 liquidity = _users[msg.sender].liquidity;
-        lpToken.transfer(migrationContract, liquidity);
+        lpToken.safeTransfer(addr, liquidity);
         
-        emit LiquidityMigrated(msg.sender, liquidity, migrationContract);
+        emit LiquidityMigrated(msg.sender, liquidity, addr);
         return true;
     }
     
@@ -693,12 +663,12 @@ contract LeadStakeV2 is Owned {
         
         uint assetValue = rate(_leadAmount, address(LEAD), address(USDT));
         require(LEAD.transferFrom(msg.sender, address(this), _leadAmount), "must approve smart contract");
-        require(USDT.transferFrom(msg.sender, address(this), assetValue), "must approve smart contract");
+        USDT.safeTransferFrom(msg.sender, address(this), assetValue);
         
         if (getUserPendingBonus(msg.sender) > 0) withdrawUserBonus();
         
-        LEAD.approve(address(_uniswapRouter), _leadAmount);
-        USDT.approve(address(_uniswapRouter), assetValue);
+        LEAD.safeIncreaseAllowance(address(_uniswapRouter), _leadAmount);
+        USDT.safeIncreaseAllowance(address(_uniswapRouter), assetValue);
         
         uint platformShare = (_leadAmount.mul(taxRate)).div(100000);
         uint platformShareUSDT = rate(platformShare, address(LEAD), address(USDT));
@@ -727,8 +697,8 @@ contract LeadStakeV2 is Owned {
         if (_leadStakeV1.stakes(msg.sender) > 0) _withV1(leadAmount, leadRP);
         else _withoutV1(leadAmount, leadRP);
         
-        require(LEAD.transfer(feeTaker, platformShare));
-        require(USDT.transfer(feeTaker, platformShareUSDT));
+        LEAD.transfer(feeTaker, platformShare);
+        USDT.safeTransfer(feeTaker, platformShareUSDT);
         
         emit LiquidityAdded(msg.sender, liquidity, amountUSDT, amountLEAD);
         return true;
@@ -760,7 +730,7 @@ contract LeadStakeV2 is Owned {
         
         _users[msg.sender].liquidity = liquidity.sub(_amount); 
         
-        lpToken.approve(address(_uniswapRouter), _amount);                                         
+        lpToken.safeIncreaseAllowance(address(_uniswapRouter), _amount);                                         
         
         (uint amountLEAD, uint amountUSDT) = 
             _uniswapRouter.removeLiquidity(
@@ -785,7 +755,7 @@ contract LeadStakeV2 is Owned {
         
         _withdrawUserBonus(msg.sender, released);
         
-        if (_users[msg.sender].release <= block.timestamp) {
+        if (_users[msg.sender].release <= now) {
             
             _users[msg.sender].bonus = 0;
             _users[msg.sender].withdrawn = 0;
@@ -925,8 +895,8 @@ contract LeadStakeV2 is Owned {
         uint bonus = _users[_user].bonus;
         uint releasedPct;
         
-        if (block.timestamp >= release) releasedPct = 100;
-        else releasedPct = ((block.timestamp.sub(start)).mul(10000)).div((release.sub(start)).mul(100));
+        if (now >= release) releasedPct = 100;
+        else releasedPct = ((now.sub(start)).mul(10000)).div((release.sub(start)).mul(100));
         
         uint released = (((bonus).mul(releasedPct)).div(100));
         return released.sub(taken);
@@ -937,7 +907,7 @@ contract LeadStakeV2 is Owned {
         _users[_user].withdrawn = _users[_user].withdrawn.add(released);
         pendingBonuses = pendingBonuses.sub(released);
         
-        bonusToken.transfer(_user, released);
+        bonusToken.safeTransfer(_user, released);
     
         emit BonusWithdrawn(_user, released);
         return true;
